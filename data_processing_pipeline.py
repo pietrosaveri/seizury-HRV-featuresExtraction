@@ -22,6 +22,11 @@ from pathlib import Path
 import json
 from typing import Dict, List, Tuple, Optional
 import warnings
+import tempfile
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+from urllib.parse import urlparse
+import io
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # Import our specialized modules
@@ -29,19 +34,160 @@ from labelers import FixedSPHLabeler, WindowCenterLabeler
 from ecg_processing import ECGProcessor
 from hrv_features import HRVFeatureExtractor
 
+class S3FileHandler:
+    """Handler for S3 file operations with local file fallback."""
+    
+    def __init__(self):
+        """Initialize S3 client."""
+        try:
+            self.s3_client = boto3.client('s3')
+            # Test S3 connection
+            self.s3_client.list_buckets()
+            self.s3_available = True
+            print("S3 connection established successfully")
+        except (NoCredentialsError, ClientError) as e:
+            print(f"Warning: S3 not available ({e}). Will use local files only.")
+            self.s3_client = None
+            self.s3_available = False
+    
+    def is_s3_path(self, path: str) -> bool:
+        """Check if path is an S3 URL."""
+        return str(path).startswith('s3://')
+    
+    def parse_s3_path(self, s3_path: str) -> Tuple[str, str]:
+        """Parse S3 path into bucket and key."""
+        parsed = urlparse(s3_path)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip('/')
+        return bucket, key
+    
+    def list_s3_objects(self, s3_path: str, suffix: str = "") -> List[str]:
+        """List objects in S3 bucket with optional suffix filter."""
+        if not self.s3_available:
+            raise RuntimeError("S3 not available")
+        
+        bucket, prefix = self.parse_s3_path(s3_path)
+        
+        try:
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+            
+            objects = []
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        key = obj['Key']
+                        if suffix and not key.endswith(suffix):
+                            continue
+                        objects.append(f"s3://{bucket}/{key}")
+            
+            return sorted(objects)
+            
+        except ClientError as e:
+            print(f"Error listing S3 objects: {e}")
+            return []
+    
+    def download_s3_file(self, s3_path: str) -> str:
+        """Download S3 file to temporary local file and return local path."""
+        if not self.s3_available:
+            raise RuntimeError("S3 not available")
+        
+        bucket, key = self.parse_s3_path(s3_path)
+        
+        # Create temporary file with same extension
+        suffix = Path(key).suffix
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        temp_path = temp_file.name
+        temp_file.close()
+        
+        try:
+            self.s3_client.download_file(bucket, key, temp_path)
+            return temp_path
+        except ClientError as e:
+            print(f"Error downloading {s3_path}: {e}")
+            os.unlink(temp_path)  # Clean up temp file
+            raise
+    
+    def upload_s3_file(self, local_path: str, s3_path: str):
+        """Upload local file to S3."""
+        if not self.s3_available:
+            raise RuntimeError("S3 not available")
+        
+        bucket, key = self.parse_s3_path(s3_path)
+        
+        try:
+            self.s3_client.upload_file(local_path, bucket, key)
+            print(f"Uploaded {local_path} to {s3_path}")
+        except ClientError as e:
+            print(f"Error uploading to {s3_path}: {e}")
+            raise
+    
+    def upload_dataframe_to_s3(self, df: pd.DataFrame, s3_path: str):
+        """Upload DataFrame directly to S3 as CSV."""
+        if not self.s3_available:
+            raise RuntimeError("S3 not available")
+        
+        bucket, key = self.parse_s3_path(s3_path)
+        
+        try:
+            # Convert DataFrame to CSV string
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            csv_string = csv_buffer.getvalue()
+            
+            # Upload to S3
+            self.s3_client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=csv_string.encode('utf-8'),
+                ContentType='text/csv'
+            )
+            print(f"Uploaded DataFrame to {s3_path}")
+        except ClientError as e:
+            print(f"Error uploading DataFrame to {s3_path}: {e}")
+            raise
+    
+    def upload_json_to_s3(self, data: dict, s3_path: str):
+        """Upload dictionary as JSON to S3."""
+        if not self.s3_available:
+            raise RuntimeError("S3 not available")
+        
+        bucket, key = self.parse_s3_path(s3_path)
+        
+        try:
+            json_string = json.dumps(data, indent=2)
+            self.s3_client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=json_string.encode('utf-8'),
+                ContentType='application/json'
+            )
+            print(f"Uploaded JSON to {s3_path}")
+        except ClientError as e:
+            print(f"Error uploading JSON to {s3_path}: {e}")
+            raise
+
 class DataDiscovery:
     """Module for discovering and organizing dataset files."""
     
     def __init__(self, data_root: str):
-        self.data_root = Path(data_root)
+        self.data_root = data_root
         self.subjects_data = {}
+        self.s3_handler = S3FileHandler()
         
     def scan_dataset(self) -> Dict:
         """Scan the dataset and organize files by subject/session/run."""
         print("Scanning dataset structure...")
         
+        if self.s3_handler.is_s3_path(self.data_root):
+            return self._scan_s3_dataset()
+        else:
+            return self._scan_local_dataset()
+    
+    def _scan_local_dataset(self) -> Dict:
+        """Scan local filesystem dataset."""
         # Find all subject directories
-        subject_dirs = sorted(glob.glob(str(self.data_root / "sub-*")))
+        subject_dirs = sorted(glob.glob(str(Path(self.data_root) / "sub-*")))
         
         for subject_dir in subject_dirs:
             subject_id = Path(subject_dir).name
@@ -72,6 +218,58 @@ class DataDiscovery:
                 if os.path.exists(ecg_dir):
                     ecg_files = glob.glob(os.path.join(ecg_dir, "*_ecg.edf"))
                     self.subjects_data[subject_id][session_id]['ecg_files'] = sorted(ecg_files)
+        
+        return self.subjects_data
+    
+    def _scan_s3_dataset(self) -> Dict:
+        """Scan S3 dataset."""
+        print("Scanning S3 dataset...")
+        
+        # List all objects in the S3 bucket
+        all_objects = self.s3_handler.list_s3_objects(self.data_root)
+        
+        # Organize by subject/session
+        for s3_path in all_objects:
+            # Extract path components
+            # Example: s3://seizury-data/ds005873/sub-001/ses-01/eeg/sub-001_ses-01_task-szMonitoring_run-01_eeg.edf
+            path_parts = s3_path.replace(self.data_root + "/", "").split("/")
+            
+            if len(path_parts) < 4:  # Need at least sub-XXX/ses-XX/modality/file
+                continue
+                
+            subject_id = path_parts[0]  # sub-001
+            session_id = path_parts[1]  # ses-01
+            modality = path_parts[2]    # eeg or ecg
+            filename = path_parts[3]    # actual filename
+            
+            # Initialize subject if not exists
+            if subject_id not in self.subjects_data:
+                self.subjects_data[subject_id] = {}
+            
+            # Initialize session if not exists
+            if session_id not in self.subjects_data[subject_id]:
+                self.subjects_data[subject_id][session_id] = {
+                    'eeg_files': [],
+                    'ecg_files': [],
+                    'annotation_files': []
+                }
+            
+            # Categorize files by type
+            if modality == "eeg":
+                if filename.endswith("_eeg.edf"):
+                    self.subjects_data[subject_id][session_id]['eeg_files'].append(s3_path)
+                elif filename.endswith("_events.tsv"):
+                    self.subjects_data[subject_id][session_id]['annotation_files'].append(s3_path)
+            elif modality == "ecg":
+                if filename.endswith("_ecg.edf"):
+                    self.subjects_data[subject_id][session_id]['ecg_files'].append(s3_path)
+        
+        # Sort file lists
+        for subject_id in self.subjects_data:
+            for session_id in self.subjects_data[subject_id]:
+                self.subjects_data[subject_id][session_id]['eeg_files'].sort()
+                self.subjects_data[subject_id][session_id]['ecg_files'].sort()
+                self.subjects_data[subject_id][session_id]['annotation_files'].sort()
         
         return self.subjects_data
     
@@ -143,6 +341,7 @@ class AnnotationProcessor:
     
     def __init__(self):
         self.event_definitions = self._load_event_definitions()
+        self.s3_handler = S3FileHandler()
     
     def _load_event_definitions(self) -> Dict:
         """Load ILAE 2017 seizure event definitions."""
@@ -219,11 +418,23 @@ class AnnotationProcessor:
     
     def load_annotations(self, annotation_file: str) -> pd.DataFrame:
         """Load and process annotation file."""
-        if not os.path.exists(annotation_file):
-            return pd.DataFrame()
+        local_file = None
         
         try:
-            annotations = pd.read_csv(annotation_file, sep='\t')
+            # Handle S3 files
+            if self.s3_handler.is_s3_path(annotation_file):
+                if not self.s3_handler.s3_available:
+                    print(f"Warning: S3 not available, cannot load {annotation_file}")
+                    return pd.DataFrame()
+                local_file = self.s3_handler.download_s3_file(annotation_file)
+                file_to_read = local_file
+            else:
+                # Local file
+                if not os.path.exists(annotation_file):
+                    return pd.DataFrame()
+                file_to_read = annotation_file
+            
+            annotations = pd.read_csv(file_to_read, sep='\t')
             
             # Check if we have the expected eventType column
             if 'eventType' not in annotations.columns:
@@ -240,6 +451,10 @@ class AnnotationProcessor:
         except Exception as e:
             print(f"Error loading annotations from {annotation_file}: {e}")
             return pd.DataFrame()
+        finally:
+            # Clean up temporary file if downloaded from S3
+            if local_file and os.path.exists(local_file):
+                os.unlink(local_file)
 
 class HRVFeatureProcessor:
     """Module for processing ECG to HRV features with Fixed SPH labeling."""
@@ -261,52 +476,77 @@ class HRVFeatureProcessor:
         )
         self.ecg_processor = ECGProcessor(sampling_rate=sampling_rate)
         self.hrv_extractor = HRVFeatureExtractor()
+        self.s3_handler = S3FileHandler()
         
     def process_recording(self, eeg_file: str, ecg_file: str, 
                          seizure_events: pd.DataFrame) -> pd.DataFrame:
         """Process a recording to extract HRV features with Fixed SPH labels."""
         
-        # Load EEG for timing reference and create labels
-        raw_eeg = mne.io.read_raw_edf(eeg_file, preload=True, verbose=False)
-        raw_eeg.resample(self.sampling_rate, verbose=False)
+        eeg_local_file = None
+        ecg_local_file = None
         
-        # Create Fixed SPH labels
-        labels = self.labeler.create_labels(raw_eeg, seizure_events)
-        
-        # Load ECG data
-        raw_ecg = mne.io.read_raw_edf(ecg_file, preload=True, verbose=False)
-        raw_ecg.resample(self.sampling_rate, verbose=False)
-        ecg_data = raw_ecg.get_data()[0]  # Assume single channel
-        
-        # Synchronize lengths
-        min_length = min(len(ecg_data), len(labels))
-        ecg_data = ecg_data[:min_length]
-        labels = labels[:min_length]
-        
-        # Extract tachogram from ECG
-        tachogram_result = self.ecg_processor.process_ecg_to_tachogram(ecg_data)
-        
-        if len(tachogram_result['filtered_rr']) == 0:
-            return pd.DataFrame()
-        
-        # Extract HRV features in sliding windows
-        features_df = self._extract_windowed_features(
-            tachogram_result, labels, raw_eeg.times[-1]
-        )
-        
-        # Add metadata columns
-        features_df['subject_id'] = self._extract_subject_id(ecg_file)
-        features_df['recording_id'] = Path(ecg_file).stem
-        
-        # Reorder columns
-        metadata_cols = ['subject_id', 'recording_id', 'window_start_time', 
-                        'window_center_time', 'window_end_time']
-        feature_cols = [col for col in features_df.columns 
-                       if col not in metadata_cols + ['label']]
-        ordered_cols = metadata_cols + feature_cols + ['label']
-        features_df = features_df[ordered_cols]
-        
-        return features_df
+        try:
+            # Handle S3 files - download to temp files
+            if self.s3_handler.is_s3_path(eeg_file):
+                eeg_local_file = self.s3_handler.download_s3_file(eeg_file)
+                eeg_file_to_read = eeg_local_file
+            else:
+                eeg_file_to_read = eeg_file
+                
+            if self.s3_handler.is_s3_path(ecg_file):
+                ecg_local_file = self.s3_handler.download_s3_file(ecg_file)
+                ecg_file_to_read = ecg_local_file
+            else:
+                ecg_file_to_read = ecg_file
+            
+            # Load EEG for timing reference and create labels
+            raw_eeg = mne.io.read_raw_edf(eeg_file_to_read, preload=True, verbose=False)
+            raw_eeg.resample(self.sampling_rate, verbose=False)
+            
+            # Create Fixed SPH labels
+            labels = self.labeler.create_labels(raw_eeg, seizure_events)
+            
+            # Load ECG data
+            raw_ecg = mne.io.read_raw_edf(ecg_file_to_read, preload=True, verbose=False)
+            raw_ecg.resample(self.sampling_rate, verbose=False)
+            ecg_data = raw_ecg.get_data()[0]  # Assume single channel
+            
+            # Synchronize lengths
+            min_length = min(len(ecg_data), len(labels))
+            ecg_data = ecg_data[:min_length]
+            labels = labels[:min_length]
+            
+            # Extract tachogram from ECG
+            tachogram_result = self.ecg_processor.process_ecg_to_tachogram(ecg_data)
+            
+            if len(tachogram_result['filtered_rr']) == 0:
+                return pd.DataFrame()
+            
+            # Extract HRV features in sliding windows
+            features_df = self._extract_windowed_features(
+                tachogram_result, labels, raw_eeg.times[-1]
+            )
+            
+            # Add metadata columns
+            features_df['subject_id'] = self._extract_subject_id(ecg_file)
+            features_df['recording_id'] = Path(ecg_file).stem
+            
+            # Reorder columns
+            metadata_cols = ['subject_id', 'recording_id', 'window_start_time', 
+                            'window_center_time', 'window_end_time']
+            feature_cols = [col for col in features_df.columns 
+                           if col not in metadata_cols + ['label']]
+            ordered_cols = metadata_cols + feature_cols + ['label']
+            features_df = features_df[ordered_cols]
+            
+            return features_df
+            
+        finally:
+            # Clean up temporary files
+            if eeg_local_file and os.path.exists(eeg_local_file):
+                os.unlink(eeg_local_file)
+            if ecg_local_file and os.path.exists(ecg_local_file):
+                os.unlink(ecg_local_file)
     
     def _extract_windowed_features(self, tachogram_result: Dict, 
                                  labels: np.ndarray, 
@@ -383,8 +623,12 @@ class DataProcessingPipeline:
     
     def __init__(self, data_root: str, output_dir: str = "hrv_features"):
         self.data_root = data_root
-        self.output_dir = Path(output_dir)
-        #self.output_dir.mkdir(exist_ok=True)
+        self.output_dir = output_dir
+        self.s3_handler = S3FileHandler()
+        
+        # Create output directory only if it's local
+        if not self.s3_handler.is_s3_path(output_dir):
+            Path(output_dir).mkdir(exist_ok=True)
         
         # Initialize modules
         self.discovery = DataDiscovery(data_root)
@@ -430,7 +674,12 @@ class DataProcessingPipeline:
                 return None
             
             # Create output filename
-            output_file = self.output_dir / f"{run_data['subject']}_{run_data['session']}_run-{run_data['run']}_features.csv"
+            output_filename = f"{run_data['subject']}_{run_data['session']}_run-{run_data['run']}_features.csv"
+            
+            if self.s3_handler.is_s3_path(self.output_dir):
+                output_file = f"{self.output_dir}/{output_filename}"
+            else:
+                output_file = Path(self.output_dir) / output_filename
             
             # Load seizure annotations
             seizure_events = pd.DataFrame()
@@ -448,8 +697,11 @@ class DataProcessingPipeline:
                 print(f"  No features extracted")
                 return None
             
-            # Save CSV file
-            features_df.to_csv(output_file, index=False)
+            # Save CSV file (S3 or local)
+            if self.s3_handler.is_s3_path(self.output_dir):
+                self.s3_handler.upload_dataframe_to_s3(features_df, output_file)
+            else:
+                features_df.to_csv(output_file, index=False)
             
             # Calculate statistics
             label_counts = features_df['label'].value_counts().sort_index()
@@ -457,7 +709,7 @@ class DataProcessingPipeline:
             
             print(f"  Created {total_windows} windows")
             print(f"  Label distribution: {dict(label_counts)}")
-            print(f"  Saved to: {output_file.name}")
+            print(f"  Saved to: {output_filename}")
             
             return {
                 'subject': run_data['subject'],
@@ -503,8 +755,12 @@ class DataProcessingPipeline:
         print(f"  Seizure (2): {total_seizure:,} ({total_seizure/total_windows*100:.1f}%)")
         
         # Save summary
-        summary_file = self.output_dir / "processing_summary.csv"
-        summary_df.to_csv(summary_file, index=False)
+        if self.s3_handler.is_s3_path(self.output_dir):
+            summary_file = f"{self.output_dir}/processing_summary.csv"
+            self.s3_handler.upload_dataframe_to_s3(summary_df, summary_file)
+        else:
+            summary_file = Path(self.output_dir) / "processing_summary.csv"
+            summary_df.to_csv(summary_file, index=False)
         print(f"\nProcessing summary saved to: {summary_file}")
         
         # Save consolidated dataset info
@@ -525,36 +781,52 @@ class DataProcessingPipeline:
             }
         }
 
-        with open(self.output_dir / "dataset_info.json", 'w') as f:
-            json.dump(dataset_info, f, indent=2)
+        if self.s3_handler.is_s3_path(self.output_dir):
+            info_file = f"{self.output_dir}/dataset_info.json"
+            self.s3_handler.upload_json_to_s3(dataset_info, info_file)
+        else:
+            info_file = Path(self.output_dir) / "dataset_info.json"
+            with open(info_file, 'w') as f:
+                json.dump(dataset_info, f, indent=2)
             
-        print(f"Dataset info saved to: {self.output_dir / 'dataset_info.json'}")
+        print(f"Dataset info saved to: {info_file}")
         print(f"CSV feature files saved in: {self.output_dir}")
         
         # Create combined CSV
         print(f"\nCreating combined features CSV...")
-        all_csvs = list(self.output_dir.glob("*_features.csv"))
-        if all_csvs:
-            combined_dfs = []
-            for csv_file in all_csvs:
-                df = pd.read_csv(csv_file)
-                combined_dfs.append(df)
-            
-            combined_df = pd.concat(combined_dfs, ignore_index=True)
-            combined_file = self.output_dir / "combined_features.csv"
-            combined_df.to_csv(combined_file, index=False)
-            print(f"Combined features saved to: {combined_file}")
-            print(f"Total combined windows: {len(combined_df):,}")
+        if self.s3_handler.is_s3_path(self.output_dir):
+            # For S3, we need to list and download feature files to combine them
+            print("Note: Combined CSV creation for S3 output not implemented in this version.")
+            print("Individual feature files are available in S3.")
+        else:
+            # Local file combining (existing logic)
+            all_csvs = list(Path(self.output_dir).glob("*_features.csv"))
+            if all_csvs:
+                combined_dfs = []
+                for csv_file in all_csvs:
+                    df = pd.read_csv(csv_file)
+                    combined_dfs.append(df)
+                
+                combined_df = pd.concat(combined_dfs, ignore_index=True)
+                combined_file = Path(self.output_dir) / "combined_features.csv"
+                combined_df.to_csv(combined_file, index=False)
+                print(f"Combined features saved to: {combined_file}")
+                print(f"Total combined windows: {len(combined_df):,}")
 
 def main():
     """Main function to run the HRV feature extraction pipeline."""
-    # Configuration
+    
+    # Configuration - LOCAL FILES (comment out if using S3)
     #data_root = "/Volumes/Seizury/ds005873"
     #output_dir = "/Volumes/Seizury/HRV/hrv_features"
 
+    # Configuration - AWS S3 (comment out if using local files)
     data_root = "s3://seizury-data/ds005873"
     output_dir = "s3://seizury-data/hrv_features"
 
+    print(f"Data source: {data_root}")
+    print(f"Output destination: {output_dir}")
+    
     # Create and run pipeline
     pipeline = DataProcessingPipeline(data_root, output_dir)
     pipeline.process_dataset()

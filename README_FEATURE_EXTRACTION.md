@@ -4,12 +4,72 @@ This repository implements a complete pipeline for extracting HRV (Heart Rate Va
 
 ## 🚀 Quick Start
 
-**For most users, simply run:**
+**For Local Files:**
 ```bash
 python data_processing_pipeline.py
 ```
 
+**For AWS S3 Files:**
+```bash
+# Configure AWS credentials first (see AWS S3 Setup below)
+python data_processing_pipeline.py
+```
+
 This processes your entire dataset with optimized settings and outputs CSV files ready for LSTM training.
+
+## ☁️ **AWS S3 Support**
+
+The pipeline now supports both local files and AWS S3 storage. You can:
+- **Input:** Read EEG/ECG files directly from S3
+- **Output:** Save CSV feature files directly to S3
+- **Mixed:** Use local input with S3 output, or vice versa
+
+### **S3 Configuration in `data_processing_pipeline.py`:**
+
+```python
+# LOCAL FILES (comment/uncomment as needed)
+#data_root = "/Volumes/Seizury/ds005873"
+#output_dir = "/Volumes/Seizury/HRV/hrv_features"
+
+# AWS S3 (comment/uncomment as needed)
+data_root = "s3://seizury-data/ds005873"
+output_dir = "s3://seizury-data/hrv_features"
+```
+
+### **AWS Setup Requirements:**
+
+1. **Install boto3:**
+   ```bash
+   pip install boto3
+   ```
+
+2. **Configure AWS credentials** (choose one method):
+   
+   **Method 1: AWS CLI**
+   ```bash
+   pip install awscli
+   aws configure
+   ```
+   
+   **Method 2: Environment variables**
+   ```bash
+   export AWS_ACCESS_KEY_ID=your_access_key
+   export AWS_SECRET_ACCESS_KEY=your_secret_key
+   export AWS_DEFAULT_REGION=us-east-1
+   ```
+   
+   **Method 3: AWS credentials file** (`~/.aws/credentials`)
+   ```ini
+   [default]
+   aws_access_key_id = your_access_key
+   aws_secret_access_key = your_secret_key
+   region = us-east-1
+   ```
+
+3. **Verify S3 access:**
+   ```bash
+   aws s3 ls s3://seizury-data/
+   ```
 
 ## 🎯 Which Pipeline to Use?
 
@@ -263,14 +323,17 @@ pip install numpy pandas scipy scikit-learn mne h5py
 pip install neurokit2  # Recommended for R-peak detection
 pip install biosppy    # Alternative R-peak detection
 pip install tensorflow # For LSTM models (optional)
+pip install boto3      # For AWS S3 support (optional)
 ```
 
 ### **Setup**
 
 1. Clone or download the repository
-2. Ensure the dataset is available at `/Volumes/Seizury/ds005873`
-3. Install dependencies listed above
-4. Run: `python data_processing_pipeline.py`
+2. Install dependencies: `pip install -r requirements.txt`
+3. **For Local Files:** Ensure dataset is available at `/Volumes/Seizury/ds005873`
+4. **For AWS S3:** Configure AWS credentials (see AWS S3 Setup above)
+5. Edit `data_processing_pipeline.py` to set your data source (local or S3)
+6. Run: `python data_processing_pipeline.py`
 
 ## ⚠️ **Critical: Preventing Data Leakage**
 
