@@ -28,7 +28,7 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from urllib.parse import urlparse
 import io
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecu            
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor            
 
 def process_single_run_worker(run_data: Dict, config: Dict) -> Optional[Dict]:
     """Worker function for parallel processing of a single run."""
