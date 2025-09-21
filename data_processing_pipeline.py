@@ -20,6 +20,7 @@ import numpy as np
 import mne
 from pathlib import Path
 import json
+import time
 from typing import Dict, List, Tuple, Optional
 import warnings
 import tempfile
@@ -28,7 +29,9 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from urllib.parse import urlparse
 import io
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor            
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed    
+
+
 
 def process_single_run_worker(run_data: Dict, config: Dict) -> Optional[Dict]:
     """Worker function for parallel processing of a single run."""
@@ -93,9 +96,8 @@ def process_single_run_worker(run_data: Dict, config: Dict) -> Optional[Dict]:
         print(f"Worker error for {run_data['subject']}/{run_data['session']}/run-{run_data['run']}: {e}")
         return None
 
-def main(): as_completed
-import time
-warnings.filterwarnings('ignore', category=RuntimeWarning)
+def main():
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # Import our specialized modules
 from labelers import FixedSPHLabeler, WindowCenterLabeler
