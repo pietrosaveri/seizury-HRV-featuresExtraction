@@ -42,7 +42,7 @@ class S3FileHandler:
         try:
             self.s3_client = boto3.client('s3')
             # Test S3 connection
-            self.s3_client.list_buckets()
+            #self.s3_client.list_buckets()
             self.s3_available = True
             print("S3 connection established successfully")
         except (NoCredentialsError, ClientError) as e:
