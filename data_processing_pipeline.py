@@ -549,9 +549,12 @@ class DataProcessingPipeline:
 def main():
     """Main function to run the HRV feature extraction pipeline."""
     # Configuration
-    data_root = "/Volumes/Seizury/ds005873"
-    output_dir = "/Volumes/Seizury/HRV/hrv_features"
-    
+    #data_root = "/Volumes/Seizury/ds005873"
+    #output_dir = "/Volumes/Seizury/HRV/hrv_features"
+
+    data_root = "s3://seizury-data/ds005873"
+    output_dir = "s3://seizury-data/hrv_features"
+
     # Create and run pipeline
     pipeline = DataProcessingPipeline(data_root, output_dir)
     pipeline.process_dataset()
