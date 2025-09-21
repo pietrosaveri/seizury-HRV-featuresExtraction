@@ -36,8 +36,12 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 def process_single_run_worker(run_data: Dict, config: Dict) -> Optional[Dict]:
     """Worker function for parallel processing of a single run."""
     try:
-        # Initialize processors in worker process
+        # Initialize processors in worker process (reuse S3 handler)
+        s3_handler = S3FileHandler()  # Uses class-level connection
+        
         annotation_processor = AnnotationProcessor()
+        annotation_processor.s3_handler = s3_handler  # Share S3 handler
+        
         hrv_processor = HRVFeatureProcessor(
             sampling_rate=config['sampling_rate'],
             sph_seconds=config['sph_seconds'],
@@ -45,7 +49,7 @@ def process_single_run_worker(run_data: Dict, config: Dict) -> Optional[Dict]:
             window_size_seconds=config['window_size_seconds'],
             stride_seconds=config['stride_seconds']
         )
-        s3_handler = S3FileHandler()
+        hrv_processor.s3_handler = s3_handler  # Share S3 handler
         
         # Check if we have required files
         if not run_data['eeg_file'] or not run_data['ecg_file']:
@@ -107,18 +111,36 @@ from hrv_features import HRVFeatureExtractor
 class S3FileHandler:
     """Handler for S3 file operations with local file fallback."""
     
+    _s3_client = None  # Class-level client for reuse
+    _s3_available = None  # Class-level availability flag
+    
     def __init__(self):
-        """Initialize S3 client."""
-        try:
-            self.s3_client = boto3.client('s3')
-            # Test S3 connection
-            #self.s3_client.list_buckets()
-            self.s3_available = True
-            print("S3 connection established successfully")
-        except (NoCredentialsError, ClientError) as e:
-            print(f"Warning: S3 not available ({e}). Will use local files only.")
-            self.s3_client = None
-            self.s3_available = False
+        """Initialize S3 client with connection reuse."""
+        if S3FileHandler._s3_client is None:
+            try:
+                S3FileHandler._s3_client = boto3.client('s3')
+                S3FileHandler._s3_available = True
+                print("S3 connection established successfully")
+            except (NoCredentialsError, ClientError) as e:
+                print(f"Warning: S3 not available ({e}). Will use local files only.")
+                S3FileHandler._s3_client = None
+                S3FileHandler._s3_available = False
+        
+        self.s3_client = S3FileHandler._s3_client
+        self.s3_available = S3FileHandler._s3_available
+    
+    @classmethod
+    def initialize_s3_connection(cls):
+        """Pre-initialize S3 connection to avoid repeated initialization."""
+        if cls._s3_client is None:
+            try:
+                cls._s3_client = boto3.client('s3')
+                cls._s3_available = True
+                print("S3 connection established successfully")
+            except (NoCredentialsError, ClientError) as e:
+                print(f"Warning: S3 not available ({e}). Will use local files only.")
+                cls._s3_client = None
+                cls._s3_available = False
     
     def is_s3_path(self, path: str) -> bool:
         """Check if path is an S3 URL."""
@@ -432,9 +454,9 @@ class DataDiscovery:
 class AnnotationProcessor:
     """Module for processing seizure annotations."""
     
-    def __init__(self):
+    def __init__(self, s3_handler=None):
         self.event_definitions = self._load_event_definitions()
-        self.s3_handler = S3FileHandler()
+        self.s3_handler = s3_handler or S3FileHandler()
     
     def _load_event_definitions(self) -> Dict:
         """Load ILAE 2017 seizure event definitions."""
@@ -554,7 +576,7 @@ class HRVFeatureProcessor:
     
     def __init__(self, sampling_rate: int = 256, sph_seconds: int = 180, 
                  label_width_seconds: int = 30, window_size_seconds: float = 30.0,
-                 stride_seconds: float = 5.0):
+                 stride_seconds: float = 5.0, s3_handler=None):
         self.sampling_rate = sampling_rate
         self.sph_seconds = sph_seconds
         self.label_width_seconds = label_width_seconds
@@ -569,7 +591,7 @@ class HRVFeatureProcessor:
         )
         self.ecg_processor = ECGProcessor(sampling_rate=sampling_rate)
         self.hrv_extractor = HRVFeatureExtractor()
-        self.s3_handler = S3FileHandler()
+        self.s3_handler = s3_handler or S3FileHandler()
         
     def process_recording(self, eeg_file: str, ecg_file: str, 
                          seizure_events: pd.DataFrame) -> pd.DataFrame:
@@ -1022,6 +1044,9 @@ def main():
     print(f"Data source: {data_root}")
     print(f"Output destination: {output_dir}")
     print(f"Parallel processing: {use_parallel} ({n_workers} workers)")
+    
+    # Pre-initialize S3 connection to avoid repeated messages
+    S3FileHandler.initialize_s3_connection()
     
     # Create and run pipeline
     pipeline = DataProcessingPipeline(
