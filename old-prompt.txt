@@ -1,0 +1,124 @@
+You are given:
+The full repository root (MATLAB code): #file:ecg-preictal-identification-epilepsy 
+A Python pipeline file #file:data_processing_pipeline.py 
+
+Raw ECG and EEG files and seizure annotations (tsv) available in /Volumes/Seizury/ds005873 (no need fo you to see them because in the processsig pipelin you can see how to handle them)
+
+Your job: modify and extend the code base so it produces time-aligned HRV feature CSVs and sequence datasets for LSTM training that target an alarm at exactly 3 minutes before seizure onset (SPH = 180 s), with a narrow label tolerance window around that target. Follow the steps below and implement, test, and document everything. Use best practices: no data leakage, clear config parameters, unit checks, and a reproducible command-line entry point.
+
+Strict goals and constraints
+Prediction target: t_target = seizure_onset − SPH, with SPH = 180 s.
+Label tolerance: use label_width = 30 s (default; ±15 s). Make it configurable.
+Feature source: tachogram (RR intervals) derived from ECG. Do not compute HRV features directly from raw ECG.
+Windowing: default window_size = 30 s, stride = 5 s.
+History fed to LSTM: history = 180 s → seq_len = history / stride = 36 (default).
+Validation: use leave-one-seizure-out (LOSO) or leave-one-recording-out per patient to avoid temporal leakage.
+
+Produce streaming emulation code to mimic real-time inference and measure detection time relative to seizure onset.
+Document all changes, add unit tests / checks, and create a reproducible run script.
+Files and functions to inspect and reuse
+Inspect all MATLAB files in the repo, especially:
+#file:main_extract_features.m  and any helper functions used to compute HRV measures (time-domain, frequency-domain, nonlinear).
+any .m files that implement HRV measures (entropy, Poincaré, LF/HF via Welch or AR).
+Inspect the data processing pipelin This is the main Python pipeline you must modify. Identify existing classes/functions such as:
+discovery/loader functions (EDF reader, annotation loader)
+labeler(s) (e.g., Strategy2Labeler or similar)
+
+LSTMFormatter or windowing functions
+any existing HRV extraction hooks
+If the repo already contains MATLAB functions that compute the HRV features in main_extract_features.m, you may either:
+port the MATLAB implementations to Python (preferred for an all-Python pipeline), or
+call MATLAB from Python (only if MATLAB runtime is available and documented). 
+
+Prefer a pure-Python reimplementation using neurokit2 / pyhrv equivalents, but match definitions precisely to the MATLAB originals.
+
+
+Step-by-step list of tasks (implement in this order)
+1) Repo analysis (read-only)
+1.1. List files that compute HRV features in MATLAB and map each HRV feature name to the MATLAB function that computes it. Produce a short table: feature_name -> file.m:function.
+1.2. In data_processing_pipeline.py, list the classes and functions and briefly describe their purpose (discovery, reading, labeling, windowing). Report any gaps (no R-peak detection, no HRV extraction, etc.).
+2) Implement a Fixed-SPH labeler
+2.1. Add a new class FixedSPHLabeler to data_processing_pipeline.py (or a new module labelers.py) with signature:
+FixedSPHLabeler(sampling_rate, sph_seconds=180, label_width_seconds=30)
+2.2. Behavior:
+For each seizure event with onset_time and duration:
+compute t_target = onset_time - sph_seconds
+mark seizure samples labels[s_onset : s_onset + duration] = 2 (ictal)
+mark labels[start:end] = 1 for the SPH target window where start = t_target - label_width/2 and end = t_target + label_width/2
+if the SPH window overlaps the seizure interval, skip marking or shift as decided by a config flag; default = skip (do not label positives that overlap ictal)
+2.3. Modify the pipeline to use window_center (or window_end) to assign a window label by sampling the label array at the window center, not by majority vote. Update LSTMFormatter.create_windows() accordingly.
+3) ECG → tachogram (R-peak detection)
+3.1. If there is already an R-peak detector in the repo, reuse it and document the call. If not, implement a robust detector in Python using neurokit2.ecg_peaks() or biosppy.signals.ecg. Steps:
+bandpass filter ECG (0.5–40 Hz)
+detect peaks → r_peak_indices
+compute r_peak_times = r_peak_indices / fs
+rr = np.diff(r_peak_times) in seconds
+3.2. Save r_times and rr per recording. Add artifact handling: remove RR > 2 s or < 0.2 s; interpolate or mark windows with excessive artifacts.
+4) HRV feature extraction (per window)
+4.1. Implement compute_hrv_features(rr_window, r_times_window, window_center_time, sr) that outputs a fixed-length vector with feature names matching those from MATLAB. Required features (minimum):
+Time-domain: mean RR, mean HR, SDNN, RMSSD, pNN50
+Frequency-domain: LF power, HF power, LF/HF (use resampled tachogram and Welch)
+Nonlinear: Sample Entropy (SampEn), Approximate Entropy (ApEn), Poincaré SD1, SD2, DFA if available
+Optional: trend features, derivatives, instantaneous HR slope
+4.2. For frequency features, resample tachogram to uniform sampling before Welch (document method and parameters).
+4.3. Add a deterministic feature order and names; ensure the CSV header uses these names.
+5) Sliding windows & labels → feature CSVs
+5.1. Using window_size and stride, compute features for every window across the recording. Use consistent time assignment (prefer window end or center — choose center and document).
+5.2. Assign each window a label by sampling the label array at the window center: label = labels[window_center_index].
+5.3. Save per-recording CSVs with columns: subject_id, recording_id, window_start_time, window_center_time, window_end_time, <feature_1>,...,<feature_n>, label.
+5.4. Provide a top-level CLI python process_recording.py --input <file> --out <csv> and a pipeline python process_dataset.py --dataset-dir <...> --out-dir <...>.
+6) Sequence construction for LSTM
+6.1. Implement make_sequences_from_csv(csv, seq_len=36, stride=1) that builds (N, seq_len, n_features) arrays and aligned labels where each sequence ending at window t has label = window_label at t.
+6.2. Add balancing options (pos_weight calculation) and oversampling hooks but do not oversample in cross-validation splits (document behavior).
+7) Evaluation / cross-validation script
+7.1. Implement evaluate_loso.py to run LOSO: for each seizure (or recording) hold it out as test, train on remaining subjects/recordings. Save per-fold metrics:
+Sensitivity (per seizure): % seizures with at least one prediction at the SPH target
+False predictions per hour (FPR/h)
+Mean warning time and standard deviation (compute onset − detection_time)
+ROC AUC, precision, recall
+7.2. Report summary table and per-subject results.
+8) Streaming emulation & debounce/alarm logic
+8.1. Implement stream_emulator.py that:
+reads a recording, generates features online as windows complete,
+maintains a circular buffer of last seq_len feature vectors,
+runs inference at each stride and logs detection probabilities,
+implements debounce logic: alarm when p > thresh for k consecutive strides (configurable).
+8.2. Use emulator to compute t_detect and warning_time per seizure. Output logs.
+9) Unit tests & validation checks
+9.1. Unit tests:
+Label alignment test: for a synthetic seizure onset at t=1000 s, assert FixedSPHLabeler sets label=1 at 1000−180 ± label_width/2.
+R-peak detection test: on a short synthetic ECG with known R times, check rr matches expectations.
+Feature continuity test: ensure no NaNs in feature windows unless artifact threshold exceeded; if NaNs exist mark window as invalid and skip.
+9.2. Add a CI-friendly test runner pytest with small synthetic data.
+10) Documentation, commits, and deliverables
+10.1. Use a new git branch feat/fixed-sph-hrv-pipeline, commit small logical commits with messages describing changes.
+10.2. Add README_FEATURE_EXTRACTION.md that documents:
+how to run the pipeline end-to-end,
+default parameters and how to change them,
+file format of generated CSVs,
+evaluation and streaming emulation instructions.
+10.3. Produce a short CHANGELOG.md summarizing the modifications.
+Parameter defaults (configurable)
+SPH = 180 s
+label_width = 30 s
+window_size = 30 s, stride = 5 s
+history = 180 s (seq_len = history / stride = 36)
+R-peak filter band: 0.5–40 Hz
+Frequency analysis: Welch with window length 256 samples on resampled tachogram (document sampling frequency used)
+Expected outputs
+Per-recording CSVs: <subject>_<run>_features.csv
+A sequences/ folder with NumPy arrays or HDF5: (X_train, y_train) per split
+evaluate_loso.py results with per-fold CSV of metrics
+stream_emulator.log files with detection events (detection time, probability, warning time)
+Unit tests passing
+README and CHANGELOG added
+Additional instructions & quality checks for the LLM
+Always preserve original functionality unless intentionally replacing it; add new modules rather than overwrite where possible.
+If you port MATLAB code to Python, ensure numerical outputs match the MATLAB functions on a small test recording (compute relative differences and document).
+If any part of the repo depends on MATLAB runtime and you cannot run it, implement equivalent Python versions and note the parity tests you performed.
+If you encounter ambiguous naming or missing metadata (e.g., sampling rate), make a conservative assumption and document it; but first try to infer sampling rate from file headers.
+Deliverables to attach to your reply
+A short summary of what you changed (file-by-file).
+A usage example: exact commands to process one recording end-to-end and to run LOSO evaluation.
+A small sanity-check CSV for one subject (first 20 windows).
+Unit test results.
