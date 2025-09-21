@@ -149,24 +149,24 @@ python stream_emulator.py \
 
 ```bash
 # Step 1: Extract HRV features (choose one)
-python data_processing_pipeline.py                    # Simple batch processing
+python3 data_processing_pipeline.py                    # Simple batch processing
 # OR
-python hrv_pipeline.py --data-root /your/dataset      # Advanced configuration
+python3 hrv_pipeline.py --data-root /your/dataset      # Advanced configuration
 
 # Step 2: Create LSTM sequences with patient-level splits
-python lstm_sequences.py --input-dir hrv_features --create-splits --normalize
+python3 lstm_sequences.py --input-dir hrv_features --create-splits --normalize
 
 # Step 3: Train your model (your code)
 # Use: train_sequences.h5, val_sequences.h5, test_sequences.h5
 
 # Step 4: Evaluate with LOSO cross-validation
-python evaluate_loso.py --input-dir hrv_features --model your_model
+python3 evaluate_loso.py --input-dir hrv_features --model your_model
 
 # Step 5: Test real-time performance
-python stream_emulator.py --model your_model.pkl --ecg-file test.edf
+python3 stream_emulator.py --model your_model.pkl --ecg-file test.edf
 ```
 
-## 📊 **Output Formats**
+## 📊 **Output Formats** 
 
 ### **Feature CSV Format** (Main Output)
 
