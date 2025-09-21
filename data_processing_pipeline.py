@@ -384,7 +384,7 @@ class DataProcessingPipeline:
     def __init__(self, data_root: str, output_dir: str = "hrv_features"):
         self.data_root = data_root
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+        #self.output_dir.mkdir(exist_ok=True)
         
         # Initialize modules
         self.discovery = DataDiscovery(data_root)
