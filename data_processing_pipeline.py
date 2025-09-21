@@ -27,6 +27,74 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from urllib.parse import urlparse
 import io
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecu            
+
+def process_single_run_worker(run_data: Dict, config: Dict) -> Optional[Dict]:
+    """Worker function for parallel processing of a single run."""
+    try:
+        # Initialize processors in worker process
+        annotation_processor = AnnotationProcessor()
+        hrv_processor = HRVFeatureProcessor(
+            sampling_rate=config['sampling_rate'],
+            sph_seconds=config['sph_seconds'],
+            label_width_seconds=config['label_width_seconds'],
+            window_size_seconds=config['window_size_seconds'],
+            stride_seconds=config['stride_seconds']
+        )
+        s3_handler = S3FileHandler()
+        
+        # Check if we have required files
+        if not run_data['eeg_file'] or not run_data['ecg_file']:
+            return None
+        
+        # Create output filename
+        output_filename = f"{run_data['subject']}_{run_data['session']}_run-{run_data['run']}_features.csv"
+        
+        if s3_handler.is_s3_path(config['output_dir']):
+            output_file = f"{config['output_dir']}/{output_filename}"
+        else:
+            output_file = Path(config['output_dir']) / output_filename
+        
+        # Load seizure annotations
+        seizure_events = pd.DataFrame()
+        if run_data['annotation_file']:
+            seizure_events = annotation_processor.load_annotations(run_data['annotation_file'])
+        
+        # Process recording to extract HRV features
+        features_df = hrv_processor.process_recording(
+            run_data['eeg_file'], run_data['ecg_file'], seizure_events
+        )
+        
+        if features_df.empty:
+            return None
+        
+        # Save CSV file (S3 or local)
+        if s3_handler.is_s3_path(config['output_dir']):
+            s3_handler.upload_dataframe_to_s3(features_df, output_file)
+        else:
+            features_df.to_csv(output_file, index=False)
+        
+        # Calculate statistics
+        label_counts = features_df['label'].value_counts().sort_index()
+        total_windows = len(features_df)
+        
+        return {
+            'subject': run_data['subject'],
+            'session': run_data['session'],
+            'run': run_data['run'],
+            'n_windows': total_windows,
+            'label_counts': label_counts.to_dict(),
+            'seizure_events': len(seizure_events),
+            'output_file': str(output_file)
+        }
+        
+    except Exception as e:
+        print(f"Worker error for {run_data['subject']}/{run_data['session']}/run-{run_data['run']}: {e}")
+        return None
+
+def main(): as_completed
+import time
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # Import our specialized modules
@@ -107,6 +175,29 @@ class S3FileHandler:
             print(f"Error downloading {s3_path}: {e}")
             os.unlink(temp_path)  # Clean up temp file
             raise
+    
+    def batch_download_s3_files(self, s3_paths: List[str]) -> Dict[str, str]:
+        """Download multiple S3 files concurrently."""
+        if not self.s3_available:
+            raise RuntimeError("S3 not available")
+        
+        local_files = {}
+        max_workers = min(len(s3_paths), 4)  # Limit concurrent downloads
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_s3path = {
+                executor.submit(self.download_s3_file, s3_path): s3_path 
+                for s3_path in s3_paths
+            }
+            
+            for future in as_completed(future_to_s3path):
+                s3_path = future_to_s3path[future]
+                try:
+                    local_files[s3_path] = future.result()
+                except Exception as e:
+                    print(f"Failed to download {s3_path}: {e}")
+        
+        return local_files
     
     def upload_s3_file(self, local_path: str, s3_path: str):
         """Upload local file to S3."""
@@ -486,30 +577,45 @@ class HRVFeatureProcessor:
         ecg_local_file = None
         
         try:
-            # Handle S3 files - download to temp files
+            # Handle S3 files - batch download if both are S3
+            s3_files_to_download = []
             if self.s3_handler.is_s3_path(eeg_file):
-                eeg_local_file = self.s3_handler.download_s3_file(eeg_file)
-                eeg_file_to_read = eeg_local_file
-            else:
-                eeg_file_to_read = eeg_file
-                
+                s3_files_to_download.append(eeg_file)
             if self.s3_handler.is_s3_path(ecg_file):
-                ecg_local_file = self.s3_handler.download_s3_file(ecg_file)
-                ecg_file_to_read = ecg_local_file
+                s3_files_to_download.append(ecg_file)
+            
+            if s3_files_to_download:
+                # Batch download for efficiency
+                downloaded_files = self.s3_handler.batch_download_s3_files(s3_files_to_download)
+                eeg_file_to_read = downloaded_files.get(eeg_file, eeg_file)
+                ecg_file_to_read = downloaded_files.get(ecg_file, ecg_file)
+                
+                # Track temp files for cleanup
+                if eeg_file in downloaded_files:
+                    eeg_local_file = downloaded_files[eeg_file]
+                if ecg_file in downloaded_files:
+                    ecg_local_file = downloaded_files[ecg_file]
             else:
+                # Local files
+                eeg_file_to_read = eeg_file
                 ecg_file_to_read = ecg_file
             
-            # Load EEG for timing reference and create labels
+            # Load EEG with minimal processing
             raw_eeg = mne.io.read_raw_edf(eeg_file_to_read, preload=True, verbose=False)
-            raw_eeg.resample(self.sampling_rate, verbose=False)
+            if raw_eeg.info['sfreq'] != self.sampling_rate:
+                raw_eeg.resample(self.sampling_rate, verbose=False)
             
             # Create Fixed SPH labels
             labels = self.labeler.create_labels(raw_eeg, seizure_events)
             
-            # Load ECG data
+            # Load ECG with minimal processing
             raw_ecg = mne.io.read_raw_edf(ecg_file_to_read, preload=True, verbose=False)
-            raw_ecg.resample(self.sampling_rate, verbose=False)
+            if raw_ecg.info['sfreq'] != self.sampling_rate:
+                raw_ecg.resample(self.sampling_rate, verbose=False)
             ecg_data = raw_ecg.get_data()[0]  # Assume single channel
+            
+            # Clear raw objects to free memory
+            del raw_eeg, raw_ecg
             
             # Synchronize lengths
             min_length = min(len(ecg_data), len(labels))
@@ -524,7 +630,7 @@ class HRVFeatureProcessor:
             
             # Extract HRV features in sliding windows
             features_df = self._extract_windowed_features(
-                tachogram_result, labels, raw_eeg.times[-1]
+                tachogram_result, labels, min_length / self.sampling_rate
             )
             
             # Add metadata columns
@@ -621,10 +727,25 @@ class HRVFeatureProcessor:
 class DataProcessingPipeline:
     """Main pipeline for HRV feature extraction with Fixed SPH labeling."""
     
-    def __init__(self, data_root: str, output_dir: str = "hrv_features"):
+    def __init__(self, data_root: str, output_dir: str = "hrv_features", 
+                 n_workers: int = None, use_parallel: bool = True):
         self.data_root = data_root
         self.output_dir = output_dir
         self.s3_handler = S3FileHandler()
+        self.use_parallel = use_parallel
+        
+        # Set workers based on system capabilities
+        if n_workers is None:
+            cpu_count = multiprocessing.cpu_count()
+            # For m7i-flex.large (2 vCPUs), use both cores but leave headroom
+            if cpu_count <= 2:
+                self.n_workers = 2
+            else:
+                self.n_workers = min(cpu_count - 1, 4)  # Max 4 workers for memory constraints
+        else:
+            self.n_workers = n_workers
+            
+        print(f"Configured for {self.n_workers} parallel workers")
         
         # Create output directory only if it's local
         if not self.s3_handler.is_s3_path(output_dir):
@@ -646,24 +767,92 @@ class DataProcessingPipeline:
         print(f"  Label width: {self.hrv_processor.label_width_seconds}s") 
         print(f"  Window size: {self.hrv_processor.window_size_seconds}s")
         print(f"  Stride: {self.hrv_processor.stride_seconds}s")
+        print(f"  Parallel workers: {self.n_workers}")
         
         # Step 1: Discover data
+        start_time = time.time()
         self.discovery.scan_dataset()
         self.discovery.print_summary()
         
         matched_runs = self.discovery.match_runs()
         print(f"\nFound {len(matched_runs)} matched runs to process")
+        discovery_time = time.time() - start_time
+        print(f"Discovery completed in {discovery_time:.2f}s")
         
-        # Step 2: Process each run
+        # Step 2: Process runs (parallel or sequential)
+        if self.use_parallel and self.n_workers > 1:
+            self._process_parallel(matched_runs)
+        else:
+            self._process_sequential(matched_runs)
+        
+        # Step 3: Save comprehensive results
+        self._save_results()
+    
+    def _process_parallel(self, matched_runs: List[Dict]):
+        """Process runs using parallel workers."""
+        print(f"\nStarting parallel processing with {self.n_workers} workers...")
+        
+        # Create serializable config for workers
+        worker_config = {
+            'output_dir': self.output_dir,
+            'sampling_rate': self.hrv_processor.sampling_rate,
+            'sph_seconds': self.hrv_processor.sph_seconds,
+            'label_width_seconds': self.hrv_processor.label_width_seconds,
+            'window_size_seconds': self.hrv_processor.window_size_seconds,
+            'stride_seconds': self.hrv_processor.stride_seconds
+        }
+        
+        start_time = time.time()
+        completed = 0
+        
+        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+            # Submit all jobs
+            future_to_run = {
+                executor.submit(process_single_run_worker, run_data, worker_config): (i, run_data)
+                for i, run_data in enumerate(matched_runs)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_run):
+                i, run_data = future_to_run[future]
+                completed += 1
+                
+                try:
+                    result = future.result(timeout=600)  # 10 min timeout per file
+                    if result:
+                        self.processing_results.append(result)
+                        elapsed = time.time() - start_time
+                        rate = completed / elapsed if elapsed > 0 else 0
+                        eta = (len(matched_runs) - completed) / rate if rate > 0 else 0
+                        print(f"Completed {completed}/{len(matched_runs)} "
+                              f"({completed/len(matched_runs)*100:.1f}%) "
+                              f"- Rate: {rate:.2f}/min - ETA: {eta/60:.1f}min")
+                    else:
+                        print(f"No features extracted for {run_data['subject']}/{run_data['session']}/run-{run_data['run']}")
+                        
+                except Exception as e:
+                    print(f"Failed {run_data['subject']}/{run_data['session']}/run-{run_data['run']}: {e}")
+    
+    def _process_sequential(self, matched_runs: List[Dict]):
+        """Process runs sequentially (fallback method)."""
+        print("\nProcessing sequentially...")
+        
+        start_time = time.time()
+        
         for i, run_data in enumerate(matched_runs):
             print(f"\nProcessing run {i+1}/{len(matched_runs)}: {run_data['subject']}/{run_data['session']}/run-{run_data['run']}")
             
             result = self._process_single_run(run_data)
             if result:
                 self.processing_results.append(result)
-        
-        # Step 3: Save comprehensive results
-        self._save_results()
+                
+            # Progress reporting
+            if (i + 1) % 10 == 0 or i == len(matched_runs) - 1:
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (len(matched_runs) - i - 1) / rate if rate > 0 else 0
+                print(f"Progress: {i+1}/{len(matched_runs)} ({(i+1)/len(matched_runs)*100:.1f}%) "
+                      f"- Rate: {rate*60:.1f}/min - ETA: {eta/60:.1f}min")
         
     def _process_single_run(self, run_data: Dict) -> Optional[Dict]:
         """Process a single run to extract HRV features."""
@@ -824,12 +1013,35 @@ def main():
     data_root = "s3://seizury-data/ds005873"
     output_dir = "s3://seizury-data/hrv_features"
 
+    # Performance settings for m7i-flex.large (2 vCPUs, 8GB RAM)
+    n_workers = 2  # Use both CPU cores
+    use_parallel = True  # Enable parallel processing
+    
     print(f"Data source: {data_root}")
     print(f"Output destination: {output_dir}")
+    print(f"Parallel processing: {use_parallel} ({n_workers} workers)")
     
     # Create and run pipeline
-    pipeline = DataProcessingPipeline(data_root, output_dir)
+    pipeline = DataProcessingPipeline(
+        data_root=data_root, 
+        output_dir=output_dir,
+        n_workers=n_workers,
+        use_parallel=use_parallel
+    )
+    
+    start_time = time.time()
     pipeline.process_dataset()
+    total_time = time.time() - start_time
+    
+    print(f"\nTotal processing time: {total_time/60:.2f} minutes")
+    if pipeline.processing_results:
+        rate = len(pipeline.processing_results) / (total_time / 60)
+        print(f"Processing rate: {rate:.2f} files/minute")
 
 if __name__ == "__main__":
+    # Required for multiprocessing on Windows and some Unix systems
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Method already set
     main()
