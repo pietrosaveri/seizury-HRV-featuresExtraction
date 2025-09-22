@@ -128,6 +128,62 @@ The pipeline transforms ECG signals into HRV feature sequences suitable for LSTM
 - **Sampling Rate**: 256 Hz
 - **R-peak Filter**: 0.5-40 Hz bandpass
 - **Frequency Analysis**: 4 Hz resampling for Welch PSD
+- **Patient Selection**: Optional top-N filtering by seizure count
+
+## 🎯 **Patient Selection Feature** 
+
+### **Purpose: Improve Class Balance**
+
+The pipeline includes an optional patient selection feature that helps address severe class imbalance by focusing on patients with the most seizures.
+
+### **How It Works**
+
+1. **Count Seizures**: Analyzes annotation files to count seizures per patient across all their recordings
+2. **Rank Patients**: Sorts patients by total seizure count (descending)
+3. **Select Top N**: Processes only the top N patients with most seizures
+4. **Improve Balance**: Results in better seizure-to-normal ratio for training
+
+### **Usage Examples**
+
+```bash
+# Process only top 5 patients with most seizures
+python3 data_processing_pipeline.py --top-n-patients 5
+
+# Process only top 10 patients with most seizures  
+python3 data_processing_pipeline.py --top-n-patients 10
+
+# Process all patients (default behavior)
+python3 data_processing_pipeline.py
+```
+
+### **Example Output**
+
+```
+Patient seizure analysis:
+  sub-01: 8 seizures across 3 recordings
+  sub-05: 6 seizures across 2 recordings  
+  sub-12: 4 seizures across 4 recordings
+  sub-03: 3 seizures across 2 recordings
+  sub-08: 2 seizures across 3 recordings
+  ...
+
+Selecting top 5 patients: ['sub-01', 'sub-05', 'sub-12', 'sub-03', 'sub-08']
+Processing 14 matched runs (filtered from 47 total runs)
+```
+
+### **Benefits**
+
+- **Better Class Balance**: Focus on seizure-rich patients improves seizure/normal ratio
+- **Faster Training**: Smaller, more relevant dataset trains faster
+- **Quality over Quantity**: Better to have good examples from fewer patients
+- **Configurable**: Easy to experiment with different patient counts
+
+### **When to Use**
+
+- **Severe Class Imbalance**: When <1% of your data is pre-seizure/seizure
+- **Limited Compute**: When you need faster iteration cycles
+- **Proof of Concept**: When testing if seizure prediction is feasible
+- **Comparative Studies**: When evaluating different patient populations
 
 ## 🎯 **Usage Examples**
 
@@ -152,6 +208,17 @@ python hrv_pipeline.py \
     --output-dir ./custom_features \
     --sph 180 \
     --label-width 30
+```
+
+**Process with patient selection (top 10 patients with most seizures):**
+```bash
+python data_processing_pipeline.py --top-n-patients 10
+
+# Or with hrv_pipeline.py:
+python hrv_pipeline.py \
+    --data-root /Volumes/Seizury/ds005873 \
+    --output-dir ./custom_features \
+    --top-n-patients 10
 ```
 
 **Process single recording:**

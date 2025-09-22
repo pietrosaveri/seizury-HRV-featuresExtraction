@@ -754,11 +754,13 @@ class DataProcessingPipeline:
     """Main pipeline for HRV feature extraction with Fixed SPH labeling."""
     
     def __init__(self, data_root: str, output_dir: str = "hrv_features", 
-                 n_workers: int = None, use_parallel: bool = True):
+                 n_workers: int = None, use_parallel: bool = True, 
+                 top_n_patients: int = None):
         self.data_root = data_root
         self.output_dir = output_dir
         self.s3_handler = S3FileHandler()
         self.use_parallel = use_parallel
+        self.top_n_patients = top_n_patients
         
         # Set workers based on system capabilities
         if n_workers is None:
@@ -785,6 +787,55 @@ class DataProcessingPipeline:
         # Results storage
         self.processing_results = []
         
+    def _count_seizures_per_patient(self, matched_runs):
+        """Count total seizures per patient across all runs."""
+        patient_seizure_counts = {}
+        
+        print("Analyzing seizure distribution across patients...")
+        
+        for run_data in matched_runs:
+            subject_id = run_data['subject']
+            
+            if subject_id not in patient_seizure_counts:
+                patient_seizure_counts[subject_id] = 0
+            
+            # Count seizures in this run
+            if run_data['annotation_file']:
+                try:
+                    seizure_events = self.annotation_processor.load_annotations(run_data['annotation_file'])
+                    patient_seizure_counts[subject_id] += len(seizure_events)
+                except Exception as e:
+                    print(f"  Warning: Could not load annotations for {subject_id}: {e}")
+                    
+        return patient_seizure_counts
+    
+    def _select_top_patients(self, matched_runs, patient_seizure_counts, top_n):
+        """Select only runs from patients with the most seizures."""
+        # Sort patients by seizure count (descending)
+        sorted_patients = sorted(patient_seizure_counts.items(), 
+                               key=lambda x: x[1], reverse=True)
+        
+        print(f"\nPatient seizure distribution:")
+        for i, (patient_id, count) in enumerate(sorted_patients[:10]):  # Show top 10
+            print(f"  {i+1}. {patient_id}: {count} seizures")
+        
+        if len(sorted_patients) > 10:
+            print(f"  ... and {len(sorted_patients) - 10} more patients")
+            
+        # Select top N patients
+        top_patients = [patient_id for patient_id, count in sorted_patients[:top_n]]
+        
+        print(f"\nSelected top {top_n} patients with most seizures:")
+        for patient_id in top_patients:
+            count = patient_seizure_counts[patient_id]
+            print(f"  {patient_id}: {count} seizures")
+        
+        # Filter runs to only include selected patients
+        filtered_runs = [run for run in matched_runs if run['subject'] in top_patients]
+        
+        print(f"\nFiltered from {len(matched_runs)} to {len(filtered_runs)} runs")
+        return filtered_runs
+    
     def process_dataset(self):
         """Process the entire dataset to extract HRV features."""
         print("Starting HRV feature extraction pipeline...")
@@ -794,6 +845,8 @@ class DataProcessingPipeline:
         print(f"  Window size: {self.hrv_processor.window_size_seconds}s")
         print(f"  Stride: {self.hrv_processor.stride_seconds}s")
         print(f"  Parallel workers: {self.n_workers}")
+        if self.top_n_patients:
+            print(f"  Patient selection: Top {self.top_n_patients} patients with most seizures")
         
         # Step 1: Discover data
         start_time = time.time()
@@ -804,6 +857,11 @@ class DataProcessingPipeline:
         print(f"\nFound {len(matched_runs)} matched runs to process")
         discovery_time = time.time() - start_time
         print(f"Discovery completed in {discovery_time:.2f}s")
+        
+        # Step 1.5: Optional patient selection based on seizure count
+        if self.top_n_patients:
+            patient_seizure_counts = self._count_seizures_per_patient(matched_runs)
+            matched_runs = self._select_top_patients(matched_runs, patient_seizure_counts, self.top_n_patients)
         
         # Step 2: Process runs (parallel or sequential)
         if self.use_parallel and self.n_workers > 1:
@@ -1030,22 +1088,41 @@ class DataProcessingPipeline:
 
 def main():
     """Main function to run the HRV feature extraction pipeline."""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='HRV Feature Extraction Pipeline')
+    parser.add_argument('--data-root', type=str, 
+                       help='Data root directory (default: /Volumes/Seizury/ds005873)')
+    parser.add_argument('--output-dir', type=str,
+                       help='Output directory (default: /Volumes/Seizury/HRV/hrv_features)')
+    parser.add_argument('--top-n-patients', type=int, default=None,
+                       help='Select only top N patients with most seizures')
+    parser.add_argument('--n-workers', type=int, default=2,
+                       help='Number of parallel workers (default: 2)')
+    parser.add_argument('--no-parallel', action='store_true',
+                       help='Disable parallel processing')
+    
+    args = parser.parse_args()
     
     # Configuration - LOCAL FILES (comment out if using S3)
-    #data_root = "/Volumes/Seizury/ds005873"
-    #output_dir = "/Volumes/Seizury/HRV/hrv_features"
+    data_root = args.data_root or "/Volumes/Seizury/ds005873"
+    output_dir = args.output_dir or "/Volumes/Seizury/HRV/hrv_features"
 
     # Configuration - AWS S3 (comment out if using local files)
-    data_root = "s3://seizury-data/ds005873"
-    output_dir = "s3://seizury-data/hrv_features"
+    #data_root = args.data_root or "s3://seizury-data/ds005873"
+    #output_dir = args.output_dir or "s3://seizury-data/hrv_features"
 
     # Performance settings for m7i-flex.large (2 vCPUs, 8GB RAM)
-    n_workers = 2  # Use both CPU cores
-    use_parallel = True  # Enable parallel processing
+    n_workers = args.n_workers  # Use specified number of workers
+    use_parallel = not args.no_parallel  # Enable parallel processing unless disabled
+    top_n_patients = args.top_n_patients  # Patient selection
     
     print(f"Data source: {data_root}")
     print(f"Output destination: {output_dir}")
     print(f"Parallel processing: {use_parallel} ({n_workers} workers)")
+    if top_n_patients:
+        print(f"Patient selection: Top {top_n_patients} patients with most seizures")
     
     # Pre-initialize S3 connection to avoid repeated messages
     S3FileHandler.initialize_s3_connection()
@@ -1055,7 +1132,8 @@ def main():
         data_root=data_root, 
         output_dir=output_dir,
         n_workers=n_workers,
-        use_parallel=use_parallel
+        use_parallel=use_parallel,
+        top_n_patients=top_n_patients
     )
     
     start_time = time.time()
