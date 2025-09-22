@@ -1,0 +1,43 @@
+{
+    "n_sequences": 931685,
+    "sequence_shape": [
+        931685,
+        36,
+        22
+    ],
+    "feature_names": [
+        "NN50",
+        "pNN50",
+        "RMSSD",
+        "SDNN",
+        "SDSD",
+        "RRMean",
+        "RRMin",
+        "RRMax",
+        "RRVar",
+        "TOTAL_POWER",
+        "VLF_POWER",
+        "LF_POWER",
+        "HF_POWER",
+        "VLF_NORM",
+        "LF_NORM",
+        "HF_NORM",
+        "LF_TO_HF",
+        "SD1",
+        "SD2",
+        "SD1toSD2",
+        "SampEn",
+        "ApEn"
+    ],
+    "label_distribution": {
+        "0": 930603,
+        "2": 800,
+        "1": 282
+    },
+    "class_weights": {
+        "0": 0.3337208956629913,
+        "1": 1101.2825059101656,
+        "2": 388.20208333333335
+    },
+    "normalized": true
+}

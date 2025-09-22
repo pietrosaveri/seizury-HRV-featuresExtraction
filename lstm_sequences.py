@@ -202,6 +202,12 @@ class LSTMSequenceBuilder:
                 self.logger.warning(f"Empty DataFrame in {csv_file}")
                 continue
             
+            # Debug: Check what columns we have
+            self.logger.debug(f"Columns in {Path(csv_file).name}: {list(df.columns)}")
+            if 'subject_id' in df.columns:
+                unique_subjects = df['subject_id'].unique()
+                self.logger.debug(f"Subject IDs found: {unique_subjects} (types: {[type(s) for s in unique_subjects]})")
+            
             # Group by recording to maintain temporal continuity
             if 'recording_id' in df.columns:
                 recordings = df['recording_id'].unique()
@@ -223,10 +229,29 @@ class LSTMSequenceBuilder:
                     all_labels.append(labels)
                     all_timestamps.append(timestamps)
                     
-                    # Track metadata
-                    subject_id = recording_df['subject_id'].iloc[0] if 'subject_id' in recording_df.columns else 'unknown'
+                    # Track metadata - ensure subject_id is string
+                    if 'subject_id' in recording_df.columns:
+                        subject_id = str(recording_df['subject_id'].iloc[0])
+                        # If it's just a number, try to reconstruct from filename
+                        if subject_id.isdigit():
+                            csv_filename = Path(csv_file).name
+                            if 'sub-' in csv_filename:
+                                subject_part = csv_filename.split('sub-')[1].split('_')[0]
+                                subject_id = f"sub-{subject_part}"
+                            else:
+                                subject_id = f"sub-{subject_id.zfill(3)}"  # Pad with zeros
+                    else:
+                        # Extract from filename if no subject_id column
+                        csv_filename = Path(csv_file).name
+                        if 'sub-' in csv_filename:
+                            subject_part = csv_filename.split('sub-')[1].split('_')[0]
+                            subject_id = f"sub-{subject_part}"
+                        else:
+                            subject_id = 'unknown'
+                    
+                    self.logger.debug(f"Using subject_id: {subject_id} for {len(sequences)} sequences")
                     all_subjects.extend([subject_id] * len(sequences))
-                    all_recordings.extend([recording_id] * len(sequences))
+                    all_recordings.extend([str(recording_id)] * len(sequences))
         
         if not all_sequences:
             raise ValueError("No sequences could be created from the provided CSV files")
@@ -256,8 +281,13 @@ class LSTMSequenceBuilder:
             f.create_dataset('X', data=X, compression='gzip')
             f.create_dataset('y', data=y, compression='gzip')
             f.create_dataset('timestamps', data=timestamps, compression='gzip')
-            f.create_dataset('subjects', data=[s.encode() for s in all_subjects], compression='gzip')
-            f.create_dataset('recordings', data=[r.encode() for r in all_recordings], compression='gzip')
+            
+            # Ensure subjects and recordings are strings before encoding
+            subjects_encoded = [str(s).encode() for s in all_subjects]
+            recordings_encoded = [str(r).encode() for r in all_recordings]
+            
+            f.create_dataset('subjects', data=subjects_encoded, compression='gzip')
+            f.create_dataset('recordings', data=recordings_encoded, compression='gzip')
             
             # Save metadata
             f.attrs['seq_len'] = self.seq_len
@@ -309,7 +339,7 @@ class LSTMSequenceBuilder:
                 'seq_len': f.attrs['seq_len'],
                 'n_features': f.attrs['n_features'],
                 'n_sequences': f.attrs['n_sequences'],
-                'feature_names': [name.decode() for name in f.attrs['feature_names']],
+                'feature_names': [name.decode() if isinstance(name, bytes) else str(name) for name in f.attrs['feature_names']],
                 'normalized': f.attrs['normalized'],
                 'class_weights': f.attrs['class_weights']
             }
@@ -317,9 +347,9 @@ class LSTMSequenceBuilder:
             if 'timestamps' in f:
                 metadata['timestamps'] = f['timestamps'][:]
             if 'subjects' in f:
-                metadata['subjects'] = [s.decode() for s in f['subjects'][:]]
+                metadata['subjects'] = [s.decode() if isinstance(s, bytes) else str(s) for s in f['subjects'][:]]
             if 'recordings' in f:
-                metadata['recordings'] = [r.decode() for r in f['recordings'][:]]
+                metadata['recordings'] = [r.decode() if isinstance(r, bytes) else str(r) for r in f['recordings'][:]]
         
         return X, y, metadata
     
@@ -499,7 +529,7 @@ class LSTMSequenceBuilder:
                     if isinstance(value, (list, np.ndarray)) and len(value) == len(X):
                         split_value = np.array(value)[mask]
                         if key in ['subjects', 'recordings']:
-                            # Handle string arrays
+                            # Handle string arrays - encode only if they're strings
                             f.create_dataset(key, data=[s.encode() if isinstance(s, str) else s for s in split_value], compression='gzip')
                         else:
                             f.create_dataset(key, data=split_value, compression='gzip')
@@ -541,7 +571,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='Build LSTM sequences from HRV features')
     parser.add_argument('--input-dir', required=True, help='Directory with feature CSV files')
-    parser.add_argument('--output-dir', default='sequences', help='Output directory')
+    parser.add_argument('--output-dir', default='/Volumes/Seizury/HRV/sequences', help='Output directory')
     parser.add_argument('--seq-len', type=int, default=36, help='Sequence length')
     parser.add_argument('--history', type=float, default=180.0, help='History length (seconds)')
     parser.add_argument('--stride', type=int, default=1, help='Sequence stride')

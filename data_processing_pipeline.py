@@ -744,7 +744,9 @@ class HRVFeatureProcessor:
         """Extract subject ID from filepath."""
         filename = Path(filepath).name
         if 'sub-' in filename:
-            return filename.split('sub-')[1].split('_')[0]
+            # Return full subject ID like "sub-001" instead of just "001"
+            subject_part = filename.split('sub-')[1].split('_')[0]
+            return f"sub-{subject_part}"
         return 'unknown'
 
 
