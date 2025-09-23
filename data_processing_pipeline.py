@@ -574,7 +574,7 @@ class AnnotationProcessor:
 class HRVFeatureProcessor:
     """Module for processing ECG to HRV features with Fixed SPH labeling."""
     
-    def __init__(self, sampling_rate: int = 256, sph_seconds: int = 180, 
+    def __init__(self, sampling_rate: int = 256, sph_seconds: int = 2400, #180 era per 3 min 
                  label_width_seconds: int = 30, window_size_seconds: float = 30.0,
                  stride_seconds: float = 5.0, s3_handler=None):
         self.sampling_rate = sampling_rate
@@ -1106,12 +1106,12 @@ def main():
     args = parser.parse_args()
     
     # Configuration - LOCAL FILES (comment out if using S3)
-    data_root = args.data_root or "/Volumes/Seizury/ds005873"
-    output_dir = args.output_dir or "/Volumes/Seizury/HRV/hrv_features"
+    #data_root = args.data_root or "/Volumes/Seizury/ds005873"
+    #output_dir = args.output_dir or "/Volumes/Seizury/HRV/top20_hrv_features"
 
     # Configuration - AWS S3 (comment out if using local files)
-    #data_root = args.data_root or "s3://seizury-data/ds005873"
-    #output_dir = args.output_dir or "s3://seizury-data/hrv_features"
+    data_root = args.data_root or "s3://seizury-data/ds005873"
+    output_dir = args.output_dir or "s3://seizury-data/40min_hrv_features"
 
     # Performance settings for m7i-flex.large (2 vCPUs, 8GB RAM)
     n_workers = args.n_workers  # Use specified number of workers
